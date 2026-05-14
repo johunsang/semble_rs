@@ -19,6 +19,7 @@ fn get_language(name: &str) -> Option<Language> {
         "java" => tree_sitter_java::LANGUAGE,
         "c" => tree_sitter_c::LANGUAGE,
         "cpp" => tree_sitter_cpp::LANGUAGE,
+        "kotlin" => tree_sitter_kotlin_ng::LANGUAGE,
         _ => return None,
     };
     Some(Language::from(lang_fn))
@@ -91,6 +92,16 @@ fn is_definition_node(language: &str, node: &Node) -> bool {
                 | "namespace_definition"
                 | "template_declaration"
         ),
+        "kotlin" => matches!(
+            kind,
+            "class_declaration"
+                | "object_declaration"
+                | "function_declaration"
+                | "property_declaration"
+                | "type_alias"
+                | "companion_object"
+                | "secondary_constructor"
+        ),
         _ => false,
     }
 }
@@ -139,7 +150,10 @@ fn chunk_with_tree_sitter(source: &str, language: &str) -> Option<Vec<ChunkBound
         return None;
     }
 
-    Some(merge_adjacent_chunks(&boundaries, DESIRED_CHUNK_LENGTH_CHARS))
+    Some(merge_adjacent_chunks(
+        &boundaries,
+        DESIRED_CHUNK_LENGTH_CHARS,
+    ))
 }
 
 fn merge_adjacent_chunks(chunks: &[ChunkBoundary], desired_length: usize) -> Vec<ChunkBoundary> {
@@ -267,17 +281,24 @@ struct MyStruct {
             "fn foo() {{\n{long_body}}}\n\nfn bar() {{\n{long_body}}}\n\nfn baz() {{\n{long_body}}}\n"
         );
         let chunks = chunk_source(&source, "test.rs", Some("rust"));
-        assert!(chunks.len() >= 2, "large source should split: got {} chunks", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "large source should split: got {} chunks",
+            chunks.len()
+        );
     }
 
     #[test]
     fn test_python_tree_sitter_chunking() {
         let long_body = "    x = 1\n".repeat(100);
-        let source = format!(
-            "import os\n\nclass MyClass:\n{long_body}\ndef standalone():\n{long_body}\n"
-        );
+        let source =
+            format!("import os\n\nclass MyClass:\n{long_body}\ndef standalone():\n{long_body}\n");
         let chunks = chunk_source(&source, "test.py", Some("python"));
-        assert!(chunks.len() >= 2, "large python source should split: got {} chunks", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "large python source should split: got {} chunks",
+            chunks.len()
+        );
         let all_content: String = chunks.iter().map(|c| c.content.as_str()).collect();
         assert!(all_content.contains("class MyClass"));
         assert!(all_content.contains("def standalone"));
@@ -332,5 +353,52 @@ func helper() int {
         let all_content: String = chunks.iter().map(|c| c.content.as_str()).collect();
         assert!(all_content.contains("func main"));
         assert!(all_content.contains("func helper"));
+    }
+
+    #[test]
+    fn test_kotlin_tree_sitter_chunking_small() {
+        let source = r#"
+package com.example
+
+import kotlin.collections.List
+
+class Foo {
+    fun bar() = 42
+}
+
+object Singleton {
+    val x: Int = 1
+}
+
+fun topLevel(): String = "hi"
+
+typealias Name = String
+"#;
+        let chunks = chunk_source(source, "Foo.kt", Some("kotlin"));
+        assert!(!chunks.is_empty());
+        let all_content: String = chunks.iter().map(|c| c.content.as_str()).collect();
+        assert!(all_content.contains("class Foo"));
+        assert!(all_content.contains("object Singleton"));
+        assert!(all_content.contains("fun topLevel"));
+        assert!(all_content.contains("typealias Name"));
+    }
+
+    #[test]
+    fn test_kotlin_tree_sitter_uses_definition_boundaries() {
+        let body = "    val x = 1\n".repeat(80);
+        let source =
+            format!("class A {{\n{body}}}\n\nclass B {{\n{body}}}\n\nclass C {{\n{body}}}\n");
+        let chunks = chunk_source(&source, "Big.kt", Some("kotlin"));
+        assert!(
+            chunks.len() >= 3,
+            "large kotlin source should split by class: got {} chunks",
+            chunks.len()
+        );
+        assert!(chunks[0].content.contains("class A"));
+        assert!(
+            !chunks[0].content.contains("class B"),
+            "first chunk should end at the next top-level definition"
+        );
+        assert!(chunks[1].content.trim_start().starts_with("class B"));
     }
 }

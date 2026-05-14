@@ -13,6 +13,7 @@ fn get_language(name: &str) -> Option<Language> {
         "java" => tree_sitter_java::LANGUAGE,
         "c" => tree_sitter_c::LANGUAGE,
         "cpp" => tree_sitter_cpp::LANGUAGE,
+        "kotlin" => tree_sitter_kotlin_ng::LANGUAGE,
         _ => return None,
     };
     Some(Language::from(lang_fn))
@@ -30,6 +31,8 @@ pub struct FileNode {
     pub symbols: Vec<Symbol>,
     pub raw_imports: Vec<String>,
     pub depends_on: Vec<String>,
+    #[serde(skip)]
+    pub package_name: Option<String>,
     #[serde(skip)]
     pub source: String,
 }
@@ -76,6 +79,7 @@ impl DependencyGraph {
 
         let symbols = extract_symbols(source, language, &root);
         let raw_imports = extract_imports(source, language, &root);
+        let package_name = extract_package(source, language, &root);
 
         self.files.insert(
             file_path.to_string(),
@@ -83,6 +87,7 @@ impl DependencyGraph {
                 symbols,
                 raw_imports,
                 depends_on: Vec::new(),
+                package_name,
                 source: source.to_string(),
             },
         );
@@ -91,6 +96,8 @@ impl DependencyGraph {
     pub fn resolve_dependencies(&mut self) {
         let all_paths: Vec<String> = self.files.keys().cloned().collect();
         let file_stems: HashMap<String, Vec<String>> = build_stem_index(&all_paths);
+        let file_packages: HashMap<String, Option<String>> = build_package_index(&self.files);
+        let symbol_index = build_symbol_index(&self.files);
 
         let resolutions: Vec<(String, Vec<String>)> = self
             .files
@@ -99,7 +106,16 @@ impl DependencyGraph {
                 let deps = node
                     .raw_imports
                     .iter()
-                    .filter_map(|imp| resolve_import(imp, fp, &file_stems, &all_paths))
+                    .filter_map(|imp| {
+                        resolve_import(
+                            imp,
+                            fp,
+                            &file_stems,
+                            &file_packages,
+                            &symbol_index,
+                            &all_paths,
+                        )
+                    })
                     .filter(|dep| dep != fp)
                     .collect::<HashSet<_>>()
                     .into_iter()
@@ -195,7 +211,7 @@ impl DependencyGraph {
         let mut imported_names: HashSet<String> = HashSet::new();
         for node in self.files.values() {
             for imp in &node.raw_imports {
-                if let Some(last) = imp.rsplit(&[':','.','/','\\']).next() {
+                if let Some(last) = imp.rsplit(&[':', '.', '/', '\\']).next() {
                     imported_names.insert(last.to_string());
                     let lower = last.to_lowercase();
                     if lower != *last {
@@ -211,8 +227,8 @@ impl DependencyGraph {
             if name == "main" || name == "new" || name == "default" || name == "lib" {
                 continue;
             }
-            let referenced = imported_names.contains(name)
-                || imported_names.contains(&name.to_lowercase());
+            let referenced =
+                imported_names.contains(name) || imported_names.contains(&name.to_lowercase());
             if !referenced && locations.len() == 1 {
                 let (fp, sym) = &locations[0];
                 if is_entry_point(fp) {
@@ -232,7 +248,11 @@ impl DependencyGraph {
                 }
             }
         }
-        results.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.symbol.line.cmp(&b.symbol.line)));
+        results.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.symbol.line.cmp(&b.symbol.line))
+        });
         results
     }
 
@@ -293,9 +313,12 @@ fn extract_symbol_from_node(source: &str, language: &str, node: &Node) -> Option
                 let mut c = node.walk();
                 for child in node.children(&mut c) {
                     match child.kind() {
-                        "function_declaration" | "class_declaration"
-                        | "interface_declaration" | "type_alias_declaration"
-                        | "enum_declaration" | "lexical_declaration" => {
+                        "function_declaration"
+                        | "class_declaration"
+                        | "interface_declaration"
+                        | "type_alias_declaration"
+                        | "enum_declaration"
+                        | "lexical_declaration" => {
                             return extract_symbol_from_node(source, language, &child);
                         }
                         _ => {}
@@ -340,18 +363,31 @@ fn extract_symbol_from_node(source: &str, language: &str, node: &Node) -> Option
         "c" => match kind {
             "function_definition" => (
                 "function",
-                find_declarator_name(source, node).unwrap_or_else(|| node_text(source, node).chars().take(40).collect()),
+                find_declarator_name(source, node)
+                    .unwrap_or_else(|| node_text(source, node).chars().take(40).collect()),
             ),
             _ => return None,
         },
         "cpp" => match kind {
             "function_definition" => (
                 "function",
-                find_declarator_name(source, node).unwrap_or_else(|| node_text(source, node).chars().take(40).collect()),
+                find_declarator_name(source, node)
+                    .unwrap_or_else(|| node_text(source, node).chars().take(40).collect()),
             ),
             "class_specifier" => ("class", find_child_text(source, node, "name")?),
             "struct_specifier" => ("struct", find_child_text(source, node, "name")?),
             "namespace_definition" => ("namespace", find_child_text(source, node, "name")?),
+            _ => return None,
+        },
+        "kotlin" => match kind {
+            "class_declaration" => ("class", find_child_text(source, node, "name")?),
+            "object_declaration" => ("object", find_child_text(source, node, "name")?),
+            "function_declaration" => ("function", find_child_text(source, node, "name")?),
+            "property_declaration" => ("property", find_kotlin_property_name(source, node)?),
+            "type_alias" => (
+                "type_alias",
+                find_child_by_kind(source, node, "identifier")?,
+            ),
             _ => return None,
         },
         _ => return None,
@@ -427,9 +463,17 @@ fn extract_imports(source: &str, language: &str, root: &Node) -> Vec<String> {
                 if child.kind() == "preproc_include" {
                     if let Some(path) = child.child_by_field_name("path") {
                         let text = node_text(source, &path);
-                        let cleaned = text
-                            .trim_matches(|c| c == '"' || c == '<' || c == '>');
+                        let cleaned = text.trim_matches(|c| c == '"' || c == '<' || c == '>');
                         imports.push(cleaned.to_string());
+                    }
+                }
+            }
+            "kotlin" => {
+                if child.kind() == "import" {
+                    if let Some(name) = find_child_by_kind(source, &child, "qualified_identifier")
+                        .or_else(|| find_child_by_kind(source, &child, "identifier"))
+                    {
+                        imports.push(name);
                     }
                 }
             }
@@ -440,10 +484,42 @@ fn extract_imports(source: &str, language: &str, root: &Node) -> Vec<String> {
     imports
 }
 
+fn extract_package(source: &str, language: &str, root: &Node) -> Option<String> {
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        match language {
+            "kotlin" => {
+                if child.kind() == "package_header" {
+                    return find_child_by_kind(source, &child, "qualified_identifier")
+                        .or_else(|| find_child_by_kind(source, &child, "identifier"));
+                }
+            }
+            "java" => {
+                if child.kind() == "package_declaration" {
+                    let text = node_text(source, &child);
+                    return Some(
+                        text.trim_start_matches("package ")
+                            .trim_end_matches(';')
+                            .trim()
+                            .to_string(),
+                    );
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    None
+}
+
 fn extract_rust_use_path(source: &str, node: &Node) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "use_tree" || child.kind() == "scoped_identifier" || child.kind() == "identifier" {
+        if child.kind() == "use_tree"
+            || child.kind() == "scoped_identifier"
+            || child.kind() == "identifier"
+        {
             return Some(node_text(source, &child));
         }
     }
@@ -489,6 +565,16 @@ fn find_variable_name(source: &str, node: &Node) -> Option<String> {
     None
 }
 
+fn find_kotlin_property_name(source: &str, node: &Node) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "variable_declaration" {
+            return find_child_by_kind(source, &child, "identifier");
+        }
+    }
+    None
+}
+
 fn find_child_text(source: &str, node: &Node, field: &str) -> Option<String> {
     node.child_by_field_name(field)
         .map(|n| node_text(source, &n))
@@ -517,14 +603,31 @@ fn node_text(source: &str, node: &Node) -> String {
 }
 
 const ENTRY_POINT_NAMES: &[&str] = &[
-    "main.rs", "lib.rs", "mod.rs",
-    "main.ts", "main.tsx", "main.js", "main.jsx",
-    "index.ts", "index.tsx", "index.js", "index.jsx",
-    "App.tsx", "App.ts", "App.js", "App.jsx",
-    "app.tsx", "app.ts", "app.js", "app.jsx",
-    "main.go", "main.py", "main.java",
+    "main.rs",
+    "lib.rs",
+    "mod.rs",
+    "main.ts",
+    "main.tsx",
+    "main.js",
+    "main.jsx",
+    "index.ts",
+    "index.tsx",
+    "index.js",
+    "index.jsx",
+    "App.tsx",
+    "App.ts",
+    "App.js",
+    "App.jsx",
+    "app.tsx",
+    "app.ts",
+    "app.js",
+    "app.jsx",
+    "main.go",
+    "main.py",
+    "main.java",
     "__init__.py",
-    "main.c", "main.cpp",
+    "main.c",
+    "main.cpp",
 ];
 
 fn symbol_used_in_source(source: &str, name: &str, def_line: usize) -> bool {
@@ -562,17 +665,55 @@ fn build_stem_index(paths: &[String]) -> HashMap<String, Vec<String>> {
     index
 }
 
+fn build_package_index(files: &HashMap<String, FileNode>) -> HashMap<String, Option<String>> {
+    files
+        .iter()
+        .map(|(path, node)| (path.clone(), node.package_name.clone()))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct SymbolCandidate {
+    file_path: String,
+    package_name: Option<String>,
+}
+
+fn build_symbol_index(files: &HashMap<String, FileNode>) -> HashMap<String, Vec<SymbolCandidate>> {
+    let mut index: HashMap<String, Vec<SymbolCandidate>> = HashMap::new();
+    for (path, node) in files {
+        for symbol in &node.symbols {
+            index
+                .entry(symbol.name.to_lowercase())
+                .or_default()
+                .push(SymbolCandidate {
+                    file_path: path.clone(),
+                    package_name: node.package_name.clone(),
+                });
+        }
+    }
+    index
+}
+
 fn resolve_import(
     raw_import: &str,
     source_file: &str,
     stem_index: &HashMap<String, Vec<String>>,
+    file_packages: &HashMap<String, Option<String>>,
+    symbol_index: &HashMap<String, Vec<SymbolCandidate>>,
     all_paths: &[String],
 ) -> Option<String> {
     // Rust mod declaration: mod:foo → foo.rs or foo/mod.rs in same directory
     if let Some(mod_name) = raw_import.strip_prefix("mod:") {
         let source_dir = Path::new(source_file).parent().unwrap_or(Path::new(""));
-        let candidate1 = source_dir.join(format!("{mod_name}.rs")).to_string_lossy().to_string();
-        let candidate2 = source_dir.join(mod_name).join("mod.rs").to_string_lossy().to_string();
+        let candidate1 = source_dir
+            .join(format!("{mod_name}.rs"))
+            .to_string_lossy()
+            .to_string();
+        let candidate2 = source_dir
+            .join(mod_name)
+            .join("mod.rs")
+            .to_string_lossy()
+            .to_string();
         for path in all_paths {
             if *path == candidate1 || *path == candidate2 {
                 return Some(path.clone());
@@ -625,9 +766,7 @@ fn resolve_import(
     // Relative paths: ./foo, ../foo
     if raw_import.starts_with('.') {
         let source_dir = Path::new(source_file).parent().unwrap_or(Path::new(""));
-        let normalized = raw_import
-            .trim_start_matches("./")
-            .replace('.', "/");
+        let normalized = raw_import.trim_start_matches("./").replace('.', "/");
         let candidate_base = source_dir.join(&normalized);
         let base_str = candidate_base.to_string_lossy();
 
@@ -637,7 +776,12 @@ fn resolve_import(
                 return Some(path.clone());
             }
             // index.js/index.ts
-            if path.starts_with(&*base_str) && Path::new(path).file_stem().map(|s| s == "index").unwrap_or(false) {
+            if path.starts_with(&*base_str)
+                && Path::new(path)
+                    .file_stem()
+                    .map(|s| s == "index")
+                    .unwrap_or(false)
+            {
                 return Some(path.clone());
             }
         }
@@ -654,9 +798,18 @@ fn resolve_import(
                     return Some(c.clone());
                 }
             }
-            if candidates.len() == 1 {
-                return Some(candidates[0].clone());
+            if let Some(candidate) = resolve_package_stem_import(
+                raw_import,
+                last_part,
+                candidates,
+                file_packages,
+                source_file,
+            ) {
+                return Some(candidate);
             }
+        }
+        if let Some(candidates) = symbol_index.get(&last_part.to_lowercase()) {
+            return resolve_package_symbol_import(raw_import, last_part, candidates, source_file);
         }
         return None;
     }
@@ -668,11 +821,68 @@ fn resolve_import(
         .to_string_lossy()
         .to_lowercase();
     if let Some(candidates) = stem_index.get(&stem) {
-        let source_dir = Path::new(source_file).parent().unwrap_or(Path::new(""));
-        return find_closest(candidates, source_dir);
+        return find_same_directory(candidates, source_file);
     }
 
     None
+}
+
+fn resolve_package_stem_import(
+    raw_import: &str,
+    imported_stem: &str,
+    candidates: &[String],
+    file_packages: &HashMap<String, Option<String>>,
+    source_file: &str,
+) -> Option<String> {
+    let package_prefix = raw_import.strip_suffix(imported_stem)?.strip_suffix('.')?;
+    let matching_paths: Vec<String> = candidates
+        .iter()
+        .filter(|path| {
+            file_packages
+                .get(*path)
+                .and_then(|package| package.as_deref())
+                == Some(package_prefix)
+        })
+        .cloned()
+        .collect();
+    if matching_paths.is_empty() {
+        return None;
+    }
+
+    let source_dir = Path::new(source_file).parent().unwrap_or(Path::new(""));
+    find_closest(&matching_paths, source_dir)
+}
+
+fn resolve_package_symbol_import(
+    raw_import: &str,
+    imported_symbol: &str,
+    candidates: &[SymbolCandidate],
+    source_file: &str,
+) -> Option<String> {
+    let package_prefix = raw_import
+        .strip_suffix(imported_symbol)?
+        .strip_suffix('.')?;
+    let matching_paths: Vec<String> = candidates
+        .iter()
+        .filter(|candidate| candidate.package_name.as_deref() == Some(package_prefix))
+        .map(|candidate| candidate.file_path.clone())
+        .collect();
+    if matching_paths.is_empty() {
+        return None;
+    }
+
+    let source_dir = Path::new(source_file).parent().unwrap_or(Path::new(""));
+    find_closest(&matching_paths, source_dir)
+}
+
+fn find_same_directory(candidates: &[String], source_file: &str) -> Option<String> {
+    let source_dir = Path::new(source_file).parent().unwrap_or(Path::new(""));
+    let matching_paths: Vec<String> = candidates
+        .iter()
+        .filter(|path| Path::new(path.as_str()).parent().unwrap_or(Path::new("")) == source_dir)
+        .cloned()
+        .collect();
+    find_closest(&matching_paths, source_dir)
 }
 
 fn find_closest(candidates: &[String], source_dir: &Path) -> Option<String> {
@@ -690,7 +900,11 @@ fn find_closest(candidates: &[String], source_dir: &Path) -> Option<String> {
         .cloned()
 }
 
-fn find_closest_with_stem(candidates: &[String], source_dir: &Path, exact_stem: &str) -> Option<String> {
+fn find_closest_with_stem(
+    candidates: &[String],
+    source_dir: &Path,
+    exact_stem: &str,
+) -> Option<String> {
     let exact_matches: Vec<&String> = candidates
         .iter()
         .filter(|c| {
@@ -773,24 +987,36 @@ def main():
     #[test]
     fn test_impact_analysis() {
         let mut graph = DependencyGraph::new();
-        graph.files.insert("a.rs".to_string(), FileNode {
-            symbols: vec![],
-            raw_imports: vec![],
-            depends_on: vec!["b.rs".to_string()],
-            source: String::new(),
-        });
-        graph.files.insert("b.rs".to_string(), FileNode {
-            symbols: vec![],
-            raw_imports: vec![],
-            depends_on: vec!["c.rs".to_string()],
-            source: String::new(),
-        });
-        graph.files.insert("c.rs".to_string(), FileNode {
-            symbols: vec![],
-            raw_imports: vec![],
-            depends_on: vec![],
-            source: String::new(),
-        });
+        graph.files.insert(
+            "a.rs".to_string(),
+            FileNode {
+                symbols: vec![],
+                raw_imports: vec![],
+                depends_on: vec!["b.rs".to_string()],
+                package_name: None,
+                source: String::new(),
+            },
+        );
+        graph.files.insert(
+            "b.rs".to_string(),
+            FileNode {
+                symbols: vec![],
+                raw_imports: vec![],
+                depends_on: vec!["c.rs".to_string()],
+                package_name: None,
+                source: String::new(),
+            },
+        );
+        graph.files.insert(
+            "c.rs".to_string(),
+            FileNode {
+                symbols: vec![],
+                raw_imports: vec![],
+                depends_on: vec![],
+                package_name: None,
+                source: String::new(),
+            },
+        );
         graph.build_reverse_index();
 
         let impact = graph.impact("c.rs");
@@ -846,11 +1072,256 @@ export default function MainComponent() {
         graph.add_file("src/lib/firestore.ts", source, "typescript");
         let node = graph.files.get("src/lib/firestore.ts").unwrap();
         let names: Vec<&str> = node.symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"getUser"), "missing getUser, got: {names:?}");
-        assert!(names.contains(&"createPage"), "missing createPage, got: {names:?}");
-        assert!(names.contains(&"PageData"), "missing PageData, got: {names:?}");
-        assert!(names.contains(&"UserProfile"), "missing UserProfile, got: {names:?}");
-        assert!(names.contains(&"MainComponent"), "missing MainComponent, got: {names:?}");
-        assert!(names.contains(&"internal"), "missing internal, got: {names:?}");
+        assert!(
+            names.contains(&"getUser"),
+            "missing getUser, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"createPage"),
+            "missing createPage, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"PageData"),
+            "missing PageData, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"UserProfile"),
+            "missing UserProfile, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"MainComponent"),
+            "missing MainComponent, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"internal"),
+            "missing internal, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_kotlin_symbols_and_imports() {
+        let source = r#"
+package com.example
+
+import com.example.data.UserRepository
+import kotlin.collections.List
+
+class UserService {
+    fun load() = Unit
+}
+
+object UserRoutes
+
+fun createUser(): String = "ok"
+
+val defaultUserName: String = "guest"
+
+typealias UserName = String
+"#;
+        let mut graph = DependencyGraph::new();
+        graph.add_file(
+            "src/main/kotlin/com/example/UserService.kt",
+            source,
+            "kotlin",
+        );
+        let node = graph
+            .files
+            .get("src/main/kotlin/com/example/UserService.kt")
+            .unwrap();
+        let names: Vec<&str> = node.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"UserService"),
+            "missing UserService, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"UserRoutes"),
+            "missing UserRoutes, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"createUser"),
+            "missing createUser, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"defaultUserName"),
+            "missing defaultUserName, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"UserName"),
+            "missing UserName, got: {names:?}"
+        );
+        assert!(node
+            .raw_imports
+            .contains(&"com.example.data.UserRepository".to_string()));
+        assert!(node
+            .raw_imports
+            .contains(&"kotlin.collections.List".to_string()));
+    }
+
+    #[test]
+    fn test_kotlin_dependency_resolution() {
+        let mut graph = DependencyGraph::new();
+        graph.add_file(
+            "src/main/kotlin/com/example/UserService.kt",
+            "package com.example\n\nimport com.example.data.UserRepository\n\nclass UserService\n",
+            "kotlin",
+        );
+        graph.add_file(
+            "src/main/kotlin/com/example/data/UserRepository.kt",
+            "package com.example.data\n\nclass UserRepository\n",
+            "kotlin",
+        );
+        graph.resolve_dependencies();
+
+        let node = graph
+            .files
+            .get("src/main/kotlin/com/example/UserService.kt")
+            .unwrap();
+        assert_eq!(
+            node.depends_on,
+            vec!["src/main/kotlin/com/example/data/UserRepository.kt".to_string()]
+        );
+
+        let impact = graph.impact("src/main/kotlin/com/example/data/UserRepository.kt");
+        assert_eq!(
+            impact,
+            vec!["src/main/kotlin/com/example/UserService.kt".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_kotlin_top_level_symbol_import_resolution() {
+        let mut graph = DependencyGraph::new();
+        graph.add_file(
+            "src/main/kotlin/com/example/UserService.kt",
+            "package com.example\n\nimport com.example.util.formatUserName\n\nclass UserService\n",
+            "kotlin",
+        );
+        graph.add_file(
+            "src/main/kotlin/com/example/util/DateUtils.kt",
+            "package com.example.util\n\nfun formatUserName(): String = \"ok\"\n",
+            "kotlin",
+        );
+        graph.resolve_dependencies();
+
+        let node = graph
+            .files
+            .get("src/main/kotlin/com/example/UserService.kt")
+            .unwrap();
+        assert_eq!(
+            node.depends_on,
+            vec!["src/main/kotlin/com/example/util/DateUtils.kt".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_kotlin_external_import_does_not_match_local_symbol() {
+        let mut graph = DependencyGraph::new();
+        graph.add_file(
+            "parser/src/main/kotlin/io/clroot/excel/parser/ExcelParser.kt",
+            "package io.clroot.excel.parser\n\nimport org.apache.poi.ss.usermodel.Sheet\n\nclass ExcelParser\n",
+            "kotlin",
+        );
+        graph.add_file(
+            "core/src/main/kotlin/io/clroot/excel/core/model/ExcelDocument.kt",
+            "package io.clroot.excel.core.model\n\nclass Sheet\n",
+            "kotlin",
+        );
+        graph.resolve_dependencies();
+
+        let node = graph
+            .files
+            .get("parser/src/main/kotlin/io/clroot/excel/parser/ExcelParser.kt")
+            .unwrap();
+        assert!(
+            node.depends_on.is_empty(),
+            "external library import should not resolve to local Sheet: {:?}",
+            node.depends_on
+        );
+    }
+
+    #[test]
+    fn test_kotlin_external_import_with_matching_local_stem() {
+        let mut graph = DependencyGraph::new();
+        graph.add_file(
+            "src/main/kotlin/com/example/App.kt",
+            "package com.example\n\nimport org.junit.jupiter.api.Test\n\nclass App\n",
+            "kotlin",
+        );
+        graph.add_file(
+            "src/main/kotlin/com/foo/Test.kt",
+            "package com.foo\n\nclass Test\n",
+            "kotlin",
+        );
+        graph.resolve_dependencies();
+
+        let node = graph
+            .files
+            .get("src/main/kotlin/com/example/App.kt")
+            .unwrap();
+        assert!(
+            node.depends_on.is_empty(),
+            "external JUnit import should not resolve to local Test.kt: {:?}",
+            node.depends_on
+        );
+    }
+
+    #[test]
+    fn test_java_external_import_with_matching_local_stem() {
+        let mut graph = DependencyGraph::new();
+        graph.add_file(
+            "src/main/java/com/example/App.java",
+            "package com.example;\n\nimport org.junit.jupiter.api.Test;\n\nclass App {}\n",
+            "java",
+        );
+        graph.add_file(
+            "src/main/java/com/foo/Test.java",
+            "package com.foo;\n\nclass Test {}\n",
+            "java",
+        );
+        graph.resolve_dependencies();
+
+        let node = graph
+            .files
+            .get("src/main/java/com/example/App.java")
+            .unwrap();
+        assert!(
+            node.depends_on.is_empty(),
+            "external JUnit import should not resolve to local Test.java: {:?}",
+            node.depends_on
+        );
+    }
+
+    #[test]
+    fn test_python_external_import_with_matching_local_module() {
+        let mut graph = DependencyGraph::new();
+        graph.add_file(
+            "app/main.py",
+            "import requests\n\ndef main():\n    pass\n",
+            "python",
+        );
+        graph.add_file("pkg/requests.py", "def helper():\n    pass\n", "python");
+        graph.resolve_dependencies();
+
+        let node = graph.files.get("app/main.py").unwrap();
+        assert!(
+            node.depends_on.is_empty(),
+            "external requests import should not resolve to unrelated local module: {:?}",
+            node.depends_on
+        );
+    }
+
+    #[test]
+    fn test_python_same_directory_import_resolution() {
+        let mut graph = DependencyGraph::new();
+        graph.add_file(
+            "app/main.py",
+            "import helpers\n\ndef main():\n    pass\n",
+            "python",
+        );
+        graph.add_file("app/helpers.py", "def helper():\n    pass\n", "python");
+        graph.resolve_dependencies();
+
+        let node = graph.files.get("app/main.py").unwrap();
+        assert_eq!(node.depends_on, vec!["app/helpers.py".to_string()]);
     }
 }

@@ -492,7 +492,8 @@ Add the same content to `~/.codex/AGENTS.md` or project root `AGENTS.md`.
 | Java | O | O | O |
 | C | O | O | O |
 | C++ | O | O | O |
-| Ruby, PHP, Swift, Kotlin 등 | O | 줄 기반 fallback | \- |
+| Kotlin | O | O | O |
+| Ruby, PHP, Swift 등 | O | 줄 기반 fallback | \- |
 
 ---
 
@@ -952,7 +953,8 @@ can be steered to use `semble_rs` first.
 | Java | ✓ | ✓ | ✓ |
 | C | ✓ | ✓ | ✓ |
 | C++ | ✓ | ✓ | ✓ |
-| Ruby, PHP, Swift, Kotlin, ... | ✓ | line-based fallback | — |
+| Kotlin | ✓ | ✓ | ✓ |
+| Ruby, PHP, Swift, ... | ✓ | line-based fallback | — |
 
 ### FAQ
 

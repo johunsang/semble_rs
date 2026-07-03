@@ -139,42 +139,48 @@ pub fn build_plan(task: &str, path: &str, top_k: usize, results: &[SearchResult]
     }
 }
 
-pub fn print_plan(report: &PlanReport) {
-    println!("Plan for: {}", report.task);
-    println!("Path: {}", report.path);
-    println!("Confidence: {}", report.confidence);
+pub fn format_plan(report: &PlanReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Plan for: {}\n", report.task));
+    out.push_str(&format!("Path: {}\n", report.path));
+    out.push_str(&format!("Confidence: {}\n", report.confidence));
     if report.confidence == "low" {
-        println!("Low-confidence matches: treat candidates as leads, not facts.");
+        out.push_str("Low-confidence matches: treat candidates as leads, not facts.\n");
     }
-    println!();
+    out.push('\n');
 
-    println!("Recommended flow:");
+    out.push_str("Recommended flow:\n");
     for (idx, step) in report.steps.iter().enumerate() {
-        println!("{}. {}", idx + 1, step.title);
-        println!("   {}", step.command);
-        println!("   {}", step.reason);
+        out.push_str(&format!("{}. {}\n", idx + 1, step.title));
+        out.push_str(&format!("   {}\n", step.command));
+        out.push_str(&format!("   {}\n", step.reason));
     }
 
-    println!();
+    out.push('\n');
     if report.candidates.is_empty() {
-        println!("No candidate chunks found yet. Try broader natural-language wording or --include-text-files.");
+        out.push_str("No candidate chunks found yet. Try broader natural-language wording or --include-text-files.\n");
     } else {
-        println!("Likely candidates:");
+        out.push_str("Likely candidates:\n");
         for c in &report.candidates {
-            println!(
-                "{:.4} {}:{}-{}",
+            out.push_str(&format!(
+                "{:.4} {}:{}-{}\n",
                 c.score, c.file_path, c.start_line, c.end_line
-            );
+            ));
             if let Some(evidence) = &c.evidence {
-                println!("  {}", evidence);
+                out.push_str(&format!("  {}\n", evidence));
                 if evidence != &c.signature {
-                    println!("  signature: {}", c.signature);
+                    out.push_str(&format!("  signature: {}\n", c.signature));
                 }
             } else {
-                println!("  {}", c.signature);
+                out.push_str(&format!("  {}\n", c.signature));
             }
         }
     }
+    out
+}
+
+pub fn print_plan(report: &PlanReport) {
+    print!("{}", format_plan(report));
 }
 
 fn unique_code_candidate_files(candidates: &[PlanCandidate]) -> Vec<String> {

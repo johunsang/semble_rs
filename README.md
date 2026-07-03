@@ -6,7 +6,7 @@
 
 <p> <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a> <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust"></a> <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue.svg" alt="Platform"> <a href="#benchmarks"><img src="https://img.shields.io/badge/agent%20tokens-up%20to%20--99%25-brightgreen.svg" alt="Token savings"></a> <a href="./README.ko.md"><img src="https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-README.ko.md-blue.svg" alt="한국어"></a> </p>
 
-<p> <a href="#quickstart">Quickstart</a> • <a href="#search">Search</a> • <a href="#tree">Tree</a> • <a href="#digest">Digest</a> • <a href="#dependency-graph">Deps / Impact</a> • <a href="#how-it-works">How it works</a> • <a href="#benchmarks">Benchmarks</a> </p>
+<p> <a href="#quickstart">Quickstart</a> • <a href="#search">Search</a> • <a href="#tree">Tree</a> • <a href="#digest">Digest</a> • <a href="#dependency-graph">Deps / Impact</a> • <a href="#mcp-server">MCP</a> • <a href="#how-it-works">How it works</a> • <a href="#benchmarks">Benchmarks</a> </p>
 
 </div>
 
@@ -43,6 +43,7 @@ For agent integration (Claude Code, Codex, Cursor), see [Agent integration](#age
 - **Hybrid retrieval**: BM25 + Model2Vec embeddings fused with RRF, then reranked with definition / identifier-stem / file-coherence boosts and noise penalties.
 - **Dependency graph**: `deps` / `impact` show what a file imports, defines, and what changes if you touch it. Optional Graphviz `--dot` output.
 - **Build / CI compression**: `digest` auto-detects cargo, pnpm/npm/yarn/bun, tsc, pytest, go test, gradle, ruff, mypy, clang/gcc/cmake/make/swiftc, GitHub Actions.
+- **MCP server**: `semble_rs serve` exposes all search tools over stdio [MCP](https://modelcontextprotocol.io) for Claude Code, Cursor, and any MCP host.
 - **Single binary**: no Python, no daemon, no API keys. Runs on CPU.
 
 ## Search
@@ -57,13 +58,13 @@ semble_rs search "save model" https://github.com/MinishLab/model2vec   # git URL
 
 ### Output modes
 
-| Mode | Output | Token cost vs `--compact` | When to use |
-| --- | --- | --- | --- |
-| `--outline` | One signature line per chunk | **-47%** | First-pass structural scan |
-| `--group` | Directory grouping + match lines capped at 3 (`+N` overflow) | \-47% | Many match lines per chunk |
-| `--compact` | Score + path + every matching line | baseline | Precision scan |
-| `--json --strip` | Chunk bodies (comments stripped) | +800% | Tooling / pipeline integration |
-| `--json` | Chunk bodies (raw) | +900% | Tooling / pipeline integration |
+| Mode             | Output                                                       | Token cost vs `--compact` | When to use                    |
+|------------------|--------------------------------------------------------------|---------------------------|--------------------------------|
+| `--outline`      | One signature line per chunk                                 | **-47%**                  | First-pass structural scan     |
+| `--group`        | Directory grouping + match lines capped at 3 (`+N` overflow) | \-47%                     | Many match lines per chunk     |
+| `--compact`      | Score + path + every matching line                           | baseline                  | Precision scan                 |
+| `--json --strip` | Chunk bodies (comments stripped)                             | +800%                     | Tooling / pipeline integration |
+| `--json`         | Chunk bodies (raw)                                           | +900%                     | Tooling / pipeline integration |
 
 **Recommended:** `--outline` to overview → `--compact` to narrow → `--json --strip` only if the chunk body itself is needed.
 
@@ -93,11 +94,11 @@ All search-side commands accept `--model <hf-repo-or-local-path>` to override th
 
 `semble_rs tree` prints the codebase file tree using the same gitignore-aware index as `search`. It exists because `ls -R` on a real project explodes into tens or hundreds of thousands of tokens (`.git/`, `target/`, `node_modules/` all included). Measured on real repos:
 
-| Project | `semble_rs tree` | `ls -R` | Reduction |
-| --- | --- | --- | --- |
-| this repo (Rust + `target/`) | **533 B** | 398,101 B | **747×** |
-| 6,693-file Python backend | **3,950 B** | 254,066 B | **64×** |
-| 325-file ML training repo | 838 B | 7,522 B | 9× |
+| Project                      | `semble_rs tree` | `ls -R`   | Reduction |
+|------------------------------|------------------|-----------|-----------|
+| this repo (Rust + `target/`) | **533 B**        | 398,101 B | **747×**  |
+| 6,693-file Python backend    | **3,950 B**      | 254,066 B | **64×**   |
+| 325-file ML training repo    | 838 B            | 7,522 B   | 9×        |
 
 ```bash
 semble_rs tree                              # current directory
@@ -120,18 +121,18 @@ gh run view <id> --log-failed | semble_rs digest
 
 Measured on 15 real-world fixtures:
 
-| Fixture | Raw → digest | Savings |
-| --- | --- | --- |
-| `cargo build` (clean, 218 crates) | 7,611 B → 59 B | **-99.2%** |
-| `cargo test` (45 passing) | 3,368 B → 369 B | \-89.0% |
-| `pnpm install` | 1,323 B → 349 B | \-73.6% |
-| `tsc` (13 errors, 5 codes) | 1,085 B → 648 B | \-40.3% |
-| `pytest` (4 failures) | 2,762 B → 2,330 B | \-15.6% |
-| **GitHub Actions log (rust-lang/rust failed CI, real)** | **3.3 MB → 35 KB** | **-98.9%** ⭐ |
-| `go test` (with panic + stack) | 1,034 B → 475 B | \-54.1% |
-| `gradle test` (2 failures) | 1,232 B → 522 B | \-57.6% |
-| `ruff` / `mypy` / `clang` / `cmake` / `swift` | varies | \-3% to -30% |
-| **TOTAL (15 fixtures)** | **3.33 MB → 43 KB** | **-98.7%** |
+| Fixture                                                 | Raw → digest        | Savings      |
+|---------------------------------------------------------|---------------------|--------------|
+| `cargo build` (clean, 218 crates)                       | 7,611 B → 59 B      | **-99.2%**   |
+| `cargo test` (45 passing)                               | 3,368 B → 369 B     | \-89.0%      |
+| `pnpm install`                                          | 1,323 B → 349 B     | \-73.6%      |
+| `tsc` (13 errors, 5 codes)                              | 1,085 B → 648 B     | \-40.3%      |
+| `pytest` (4 failures)                                   | 2,762 B → 2,330 B   | \-15.6%      |
+| **GitHub Actions log (rust-lang/rust failed CI, real)** | **3.3 MB → 35 KB**  | **-98.9%** ⭐ |
+| `go test` (with panic + stack)                          | 1,034 B → 475 B     | \-54.1%      |
+| `gradle test` (2 failures)                              | 1,232 B → 522 B     | \-57.6%      |
+| `ruff` / `mypy` / `clang` / `cmake` / `swift`           | varies              | \-3% to -30% |
+| **TOTAL (15 fixtures)**                                 | **3.33 MB → 43 KB** | **-98.7%**   |
 
 Auto-detection covers cargo, pnpm/npm/yarn/bun, tsc, pytest, go test, gradle, ruff, mypy, clang/gcc/cmake/make/swiftc, GitHub Actions. Force a handler with `--format <name>`; inspect with `--show-format`.
 
@@ -199,6 +200,31 @@ gh run view <id> --log-failed | semble_rs digest
 
 `semble_rs savings` shows estimated tokens saved across past searches.
 
+### MCP server
+
+`semble_rs serve` runs a stdio [MCP](https://modelcontextprotocol.io) server so agents see semble as native, self-describing tools instead of shell commands — no prompt nudging, no shell quoting, and read-only tool calls that hosts can auto-approve. It exposes `search`, `tree`, `deps`, `impact`, `find_pattern`, `find_related`, and `plan` with the same stateless behavior as the CLI: every call re-indexes the target path fresh. `digest` and `savings` stay CLI-only (`digest` is a pipe; by the time an MCP tool could see the log it would already be in context).
+
+Claude Code:
+
+```bash
+claude mcp add semble -- semble_rs serve
+```
+
+Any MCP host with JSON config (Crush, Cursor, Windsurf, ...):
+
+```json
+{
+  "mcpServers": {
+    "semble": {
+      "command": "semble_rs",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+Relative `path` arguments resolve against the server's working directory (set by the host, usually the project root); absolute paths and git URLs work too. The embedding model is downloaded and cached at startup if needed. Use `serve --model <repo-or-path>` or the `SEMBLE_MODEL_PATH` env var for a custom or local model.
+
 ## How it works
 
 `semble_rs` chunks every file with `tree-sitter` at function / class / module boundaries (line-based fallback for unsupported languages), then scores every query with two complementary retrievers: static [Model2Vec](https://github.com/MinishLab/model2vec) embeddings (default `minishlab/potion-code-16M`) for semantic similarity, and BM25 for lexical matches on identifiers and API names. Score lists are fused with Reciprocal Rank Fusion.
@@ -225,21 +251,21 @@ The embedder is fully static (vocab embedding lookup → mean pool → SIF weigh
 
 100 hand-labelled queries across 5 categories: exact symbol names, natural-language feature descriptions, scenarios, acronyms, and Korean queries. Default model `minishlab/potion-code-16M`.
 
-| Metric | Score |
-| --- | --- |
-| Recall@1 | 70% |
-| Recall@5 | 90% |
-| Recall@10 | 95% |
-| MRR | 0.78 |
+| Metric         | Score                 |
+|----------------|-----------------------|
+| Recall@1       | 70%                   |
+| Recall@5       | 90%                   |
+| Recall@10      | 95%                   |
+| MRR            | 0.78                  |
 | Median latency | 150 ms / query (cold) |
 
-| Category | n | R@1 | R@5 | R@10 | MRR |
-| --- | --- | --- | --- | --- | --- |
+| Category     | n  | R@1 | R@5  | R@10 | MRR  |
+|--------------|----|-----|------|------|------|
 | exact_symbol | 30 | 93% | 100% | 100% | 0.96 |
-| nl_feature | 40 | 75% | 98% | 100% | 0.83 |
-| scenario | 10 | 70% | 100% | 100% | 0.77 |
-| acronym | 10 | 50% | 70% | 70% | 0.56 |
-| korean | 10 | 10% | 60% | 80% | 0.27 |
+| nl_feature   | 40 | 75% | 98%  | 100% | 0.83 |
+| scenario     | 10 | 70% | 100% | 100% | 0.77 |
+| acronym      | 10 | 50% | 70%  | 70%  | 0.56 |
+| korean       | 10 | 10% | 60%  | 80%  | 0.27 |
 
 Query set: `docs/eval_set_100.json` · per-miss analysis: `docs/benchmark_100.md`.
 
@@ -248,10 +274,10 @@ Query set: `docs/eval_set_100.json` · per-miss analysis: `docs/benchmark_100.md
 The index is rebuilt every run (no persistent cache).
 
 | Repo size (code files) | Indexing + first query |
-| --- | --- |
-| 22 (this repo) | **\~0.15 s** |
-| 57–120 | \~0.3–0.7 s |
-| 1,600 | \~10 s |
+|------------------------|------------------------|
+| 22 (this repo)         | **\~0.15 s**           |
+| 57–120                 | \~0.3–0.7 s            |
+| 1,600                  | \~10 s                 |
 
 `digest` is independent of repo size: 3.3 MB CI log → 35 KB in **\~20 ms**.
 
@@ -259,34 +285,34 @@ The index is rebuilt every run (no persistent cache).
 
 Measured on real projects:
 
-| Operation | `semble_rs` | Native | Reduction |
-| --- | --- | --- | --- |
-| **Codebase map** (this repo) | `tree` **533 B** | `ls -R` 398 KB | **747×** |
-| **Codebase map** (6,693-file Python backend) | `tree` **3,950 B** | `ls -R` 254 KB | **64×** |
-| **Codebase map** (325-file Python repo) | `tree` 838 B | `ls -R` 7,522 B | 9× |
-| **Code chunk lookup** (`--outline` vs `--compact`) | \-47% | baseline | \-47% |
-| **Build log** (`cargo build` clean) | `digest` 59 B | raw 7,611 B | **-99.2%** |
-| **CI failure log** (real GitHub Actions, rust-lang/rust) | `digest` 35 KB | raw 3.3 MB | **-98.9%** ⭐ |
-| **15-fixture aggregate** | `digest` 43 KB | raw 3.33 MB | **-98.7%** |
+| Operation                                                | `semble_rs`        | Native          | Reduction    |
+|----------------------------------------------------------|--------------------|-----------------|--------------|
+| **Codebase map** (this repo)                             | `tree` **533 B**   | `ls -R` 398 KB  | **747×**     |
+| **Codebase map** (6,693-file Python backend)             | `tree` **3,950 B** | `ls -R` 254 KB  | **64×**      |
+| **Codebase map** (325-file Python repo)                  | `tree` 838 B       | `ls -R` 7,522 B | 9×           |
+| **Code chunk lookup** (`--outline` vs `--compact`)       | \-47%              | baseline        | \-47%        |
+| **Build log** (`cargo build` clean)                      | `digest` 59 B      | raw 7,611 B     | **-99.2%**   |
+| **CI failure log** (real GitHub Actions, rust-lang/rust) | `digest` 35 KB     | raw 3.3 MB      | **-98.9%** ⭐ |
+| **15-fixture aggregate**                                 | `digest` 43 KB     | raw 3.33 MB     | **-98.7%**   |
 
 > Agents using `grep + cat + ls -R` spend most of their context window on irrelevant code and noise. `semble_rs` returns only what matters and compresses the rest.
 
 ## Supported languages
 
-| Language | Search | AST chunking | Dependency graph |
-| --- | --- | --- | --- |
-| Rust | ✓ | ✓ | ✓ |
-| Python | ✓ | ✓ | ✓ |
-| JavaScript / TypeScript | ✓ | ✓ | ✓ |
-| Go | ✓ | ✓ | ✓ |
-| Java | ✓ | ✓ | ✓ |
-| C / C++ | ✓ | ✓ | ✓ |
-| Kotlin | ✓ | ✓ | ✓ |
-| Ruby | ✓ | ✓ | ✓ |
-| PHP | ✓ | ✓ | ✓ |
-| Swift | ✓ | ✓ | ✓ |
-| HTML / CSS / Vue / Svelte | ✓ | line-based | partial |
-| Other | ✓ | line-based | — |
+| Language                  | Search | AST chunking | Dependency graph |
+|---------------------------|--------|--------------|------------------|
+| Rust                      | ✓      | ✓            | ✓                |
+| Python                    | ✓      | ✓            | ✓                |
+| JavaScript / TypeScript   | ✓      | ✓            | ✓                |
+| Go                        | ✓      | ✓            | ✓                |
+| Java                      | ✓      | ✓            | ✓                |
+| C / C++                   | ✓      | ✓            | ✓                |
+| Kotlin                    | ✓      | ✓            | ✓                |
+| Ruby                      | ✓      | ✓            | ✓                |
+| PHP                       | ✓      | ✓            | ✓                |
+| Swift                     | ✓      | ✓            | ✓                |
+| HTML / CSS / Vue / Svelte | ✓      | line-based   | partial          |
+| Other                     | ✓      | line-based   | —                |
 
 ## License
 

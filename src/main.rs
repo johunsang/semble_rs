@@ -5,13 +5,11 @@ use clap::{Parser, Subcommand};
 
 use semble::digest::{self, Format};
 use semble::encoder::StaticEncoder;
-use semble::filter::smart_strip;
 use semble::index::SembleIndex;
-use semble::outline::extract_signature_near;
 use semble::plan::{build_plan, print_plan};
+use semble::render;
 use semble::stats::format_savings_report;
 use semble::tree::{render as render_tree, TreeOptions};
-use semble::types::SearchResult;
 use semble::utils::{format_results, is_git_url, resolve_chunk};
 
 #[derive(Parser)]
@@ -207,6 +205,14 @@ enum Commands {
         #[arg(long)]
         show_format: bool,
     },
+    /// Start a stdio MCP server exposing search, tree, deps, impact,
+    /// find-pattern, find-related, and plan as tools for coding agents
+    Serve {
+        /// Embedding model (HF repo id or local path).
+        /// Overrides SEMBLE_MODEL_PATH; default: minishlab/potion-code-16M.
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 fn main() {
@@ -345,6 +351,12 @@ fn main() {
         Commands::Savings { verbose } => {
             print!("{}", format_savings_report(verbose));
         }
+        Commands::Serve { model } => {
+            if let Err(e) = semble::mcp::serve(model.as_deref()) {
+                eprintln!("MCP server error: {e:?}");
+                process::exit(1);
+            }
+        }
         Commands::Deps {
             file_path,
             path,
@@ -365,7 +377,7 @@ fn main() {
                     eprintln!("File not found in graph: {file_path}");
                     process::exit(1);
                 }
-                print!("{}", render_dep_tree(graph, &file_path, max_depth, false));
+                print!("{}", render::dep_tree(graph, &file_path, max_depth, false));
                 return;
             }
             if json {
@@ -381,38 +393,8 @@ fn main() {
                     }
                 }
             } else {
-                match graph.deps(&file_path) {
-                    Some(node) => {
-                        println!("File: {file_path}");
-                        println!();
-                        if !node.symbols.is_empty() {
-                            println!("Symbols ({}):", node.symbols.len());
-                            for sym in &node.symbols {
-                                println!("  {} {} (line {})", sym.kind, sym.name, sym.line);
-                            }
-                            println!();
-                        }
-                        if !node.depends_on.is_empty() {
-                            println!("Depends on ({}):", node.depends_on.len());
-                            for dep in &node.depends_on {
-                                println!("  {dep}");
-                            }
-                            println!();
-                        }
-                        let dependents = graph.dependents(&file_path);
-                        if !dependents.is_empty() {
-                            println!("Used by ({}):", dependents.len());
-                            for dep in &dependents {
-                                println!("  {dep}");
-                            }
-                        }
-                        if node.symbols.is_empty()
-                            && node.depends_on.is_empty()
-                            && dependents.is_empty()
-                        {
-                            println!("No dependencies or symbols found.");
-                        }
-                    }
+                match render::deps_summary(graph, &file_path) {
+                    Some(out) => print!("{out}"),
                     None => {
                         eprintln!("File not found in graph: {file_path}");
                         process::exit(1);
@@ -440,24 +422,18 @@ fn main() {
                     eprintln!("File not found in graph: {file_path}");
                     process::exit(1);
                 }
-                print!("{}", render_dep_tree(graph, &file_path, max_depth, true));
+                print!("{}", render::dep_tree(graph, &file_path, max_depth, true));
                 return;
             }
-            let affected = graph.impact(&file_path);
 
             if json {
+                let affected = graph.impact(&file_path);
                 println!(
                     "{}",
                     serde_json::to_string(&affected).unwrap_or_else(|_| "[]".to_string())
                 );
-            } else if affected.is_empty() {
-                println!("No files affected by changes to {file_path}.");
             } else {
-                println!("Impact of {file_path} ({} files affected):", affected.len());
-                println!();
-                for f in &affected {
-                    println!("  {f}");
-                }
+                print!("{}", render::impact_summary(graph, &file_path));
             }
         }
         Commands::Plan {
@@ -497,15 +473,15 @@ fn main() {
 
             let results = index.search(query.as_str(), top_k, None, None, None);
             if outline {
-                print_outline(&results);
+                print!("{}", render::outline(&results));
             } else if group {
-                print_grouped(&results);
+                print!("{}", render::grouped(&results));
             } else if compact {
-                print_compact(&results);
+                print!("{}", render::compact(&results));
             } else if json && strip {
-                print_json_stripped(&results);
+                println!("{}", render::json_stripped(&results));
             } else if json {
-                print_json(&results);
+                println!("{}", render::json(&results));
             } else if results.is_empty() {
                 println!("No results found.");
             } else {
@@ -536,7 +512,7 @@ fn main() {
 
             let results = index.find_related(&chunk, top_k);
             if json {
-                print_json(&results);
+                println!("{}", render::json(&results));
             } else if results.is_empty() {
                 println!("No related chunks found for {file_path}:{line}.");
             } else {
@@ -547,202 +523,6 @@ fn main() {
             }
         }
     }
-}
-
-fn print_compact(results: &[SearchResult]) {
-    for r in results {
-        println!(
-            "{:.4}\t{}:{}-{}",
-            r.score, r.chunk.file_path, r.chunk.start_line, r.chunk.end_line
-        );
-        for ml in &r.match_lines {
-            println!("  L{}:\t{}", ml.line, truncate_line(&ml.content, 120));
-        }
-    }
-}
-
-fn print_outline(results: &[SearchResult]) {
-    for r in results {
-        let match_nums: Vec<usize> = r.match_lines.iter().map(|m| m.line).collect();
-        let sig = extract_signature_near(&r.chunk.content, r.chunk.start_line, &match_nums)
-            .unwrap_or_else(|| format!("(lines {}-{})", r.chunk.start_line, r.chunk.end_line));
-        let match_suffix = if r.match_lines.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}m]", r.match_lines.len())
-        };
-        println!(
-            "{:.4} {}:{}-{}{}\n  {}",
-            r.score, r.chunk.file_path, r.chunk.start_line, r.chunk.end_line, match_suffix, sig
-        );
-    }
-}
-
-fn print_grouped(results: &[SearchResult]) {
-    use std::collections::BTreeMap;
-    let mut by_dir: BTreeMap<String, (f64, Vec<&SearchResult>)> = BTreeMap::new();
-    for r in results {
-        let dir = std::path::Path::new(&r.chunk.file_path)
-            .parent()
-            .and_then(|p| p.to_str())
-            .unwrap_or("")
-            .to_string();
-        let entry = by_dir.entry(dir).or_insert((f64::NEG_INFINITY, Vec::new()));
-        if r.score > entry.0 {
-            entry.0 = r.score;
-        }
-        entry.1.push(r);
-    }
-    let mut dirs: Vec<(&String, &(f64, Vec<&SearchResult>))> = by_dir.iter().collect();
-    dirs.sort_by(|a, b| {
-        b.1 .0
-            .partial_cmp(&a.1 .0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    const MAX_MATCH_LINES: usize = 3;
-    for (dir, (_, group)) in dirs {
-        let has_dir = !dir.is_empty();
-        if has_dir {
-            println!("{dir}/");
-        }
-        for r in group {
-            let fname = std::path::Path::new(&r.chunk.file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(r.chunk.file_path.as_str());
-            let indent = if has_dir { "  " } else { "" };
-            println!(
-                "{indent}{:.4} {fname}:{}-{}",
-                r.score, r.chunk.start_line, r.chunk.end_line
-            );
-            let total = r.match_lines.len();
-            for ml in r.match_lines.iter().take(MAX_MATCH_LINES) {
-                println!(
-                    "{indent}  L{}: {}",
-                    ml.line,
-                    truncate_line(&ml.content, 100)
-                );
-            }
-            if total > MAX_MATCH_LINES {
-                println!("{indent}  ... (+{})", total - MAX_MATCH_LINES);
-            }
-        }
-    }
-}
-
-fn render_dep_tree(
-    graph: &semble::DependencyGraph,
-    root: &str,
-    max_depth: Option<usize>,
-    reverse: bool,
-) -> String {
-    let mut out = String::new();
-    out.push_str(root);
-    out.push('\n');
-    let mut visited = std::collections::HashSet::new();
-    visited.insert(root.to_string());
-    let children = next_files(graph, root, reverse);
-    let mut prefix = String::new();
-    walk_dep_tree(graph, &children, &mut visited, &mut prefix, &mut out, 1, max_depth, reverse);
-    out
-}
-
-fn next_files(graph: &semble::DependencyGraph, file: &str, reverse: bool) -> Vec<String> {
-    if reverse {
-        graph.dependents(file).into_iter().map(String::from).collect()
-    } else {
-        graph
-            .deps(file)
-            .map(|n| n.depends_on.clone())
-            .unwrap_or_default()
-    }
-}
-
-fn walk_dep_tree(
-    graph: &semble::DependencyGraph,
-    items: &[String],
-    visited: &mut std::collections::HashSet<String>,
-    prefix: &mut String,
-    out: &mut String,
-    depth: usize,
-    max_depth: Option<usize>,
-    reverse: bool,
-) {
-    let last_idx = items.len().saturating_sub(1);
-    for (i, item) in items.iter().enumerate() {
-        let is_last = i == last_idx;
-        let connector = if is_last { "└── " } else { "├── " };
-        out.push_str(prefix);
-        out.push_str(connector);
-        out.push_str(item);
-
-        let cycle = visited.contains(item);
-        if cycle {
-            out.push_str("  (cycle)\n");
-            continue;
-        }
-        let depth_exceeded = max_depth.is_some_and(|m| depth >= m);
-        let children = if depth_exceeded {
-            vec![]
-        } else {
-            next_files(graph, item, reverse)
-        };
-        if depth_exceeded && !next_files(graph, item, reverse).is_empty() {
-            out.push_str("  …\n");
-            continue;
-        }
-        out.push('\n');
-
-        if !children.is_empty() {
-            visited.insert(item.clone());
-            let push = if is_last { "    " } else { "│   " };
-            prefix.push_str(push);
-            walk_dep_tree(graph, &children, visited, prefix, out, depth + 1, max_depth, reverse);
-            prefix.truncate(prefix.len() - push.len());
-            visited.remove(item);
-        }
-    }
-}
-
-fn truncate_line(line: &str, max_len: usize) -> String {
-    let trimmed = line.trim();
-    if trimmed.len() <= max_len {
-        return trimmed.to_string();
-    }
-    let s: String = trimmed.chars().take(max_len - 3).collect();
-    format!("{s}...")
-}
-
-fn print_json_stripped(results: &[SearchResult]) {
-    let stripped: Vec<SearchResult> = results
-        .iter()
-        .map(|r| {
-            let lang = r.chunk.language.as_deref();
-            SearchResult {
-                chunk: semble::types::Chunk::new(
-                    smart_strip(&r.chunk.content, lang),
-                    r.chunk.file_path.clone(),
-                    r.chunk.start_line,
-                    r.chunk.end_line,
-                    r.chunk.language.clone(),
-                ),
-                score: r.score,
-                match_lines: r.match_lines.clone(),
-            }
-        })
-        .collect();
-    println!(
-        "{}",
-        serde_json::to_string(&stripped).unwrap_or_else(|_| "[]".to_string())
-    );
-}
-
-fn print_json(results: &[SearchResult]) {
-    println!(
-        "{}",
-        serde_json::to_string(results).unwrap_or_else(|_| "[]".to_string())
-    );
 }
 
 fn build_index(path: &str, include_text_files: bool, model: Option<&str>) -> SembleIndex {
